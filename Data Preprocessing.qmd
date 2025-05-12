@@ -1,0 +1,161 @@
+---
+title: "Data Preprocessing"
+author: "Lu"
+format: html
+editor: visual
+---
+
+## Load the Dataset
+
+```{r}
+# Load packages
+library(tidyverse)
+
+# Read the dataset
+df <- read.csv("creditcard.csv")
+
+summary(df)
+
+```
+
+```{r}
+skim(df)
+```
+
+All predictors are numeric.
+
+Class is extremely imbalanced, so we must handle this before modeling.
+
+Many PCA variables have non-normal, high-variance distributions → visual EDA (boxplots, density plots) will help us decide if some features are especially important.
+
+Amount and Time are not standardized — these need scaling or transformation.
+
+## EDA
+
+1\. Visualize Class Imbalance
+
+```{r}
+ggplot(df, aes(x = factor(Class))) +
+  geom_bar(aes(fill = factor(Class))) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.2) +
+  scale_fill_manual(values = c("steelblue", "firebrick")) +
+  labs(title = "Class Distribution", x = "Class (0 = Non-Fraud, 1 = Fraud)", y = "Count") +
+  theme_minimal()
+```
+
+This bar chart shows the number of transactions for each class in our dataset. We clearly see a massive imbalance:
+
+There are 284,315 non-fraudulent transactions (class 0), making up nearly 99.83% of the data.
+
+In contrast, there are only 492 fraudulent transactions (class 1), which is about 0.17% of the total.
+
+If we trained a model without addressing this imbalance, it might just predict "non-fraud" for everything and still appear 99.8% "accurate" — but it would fail to catch real fraud. This makes it essential to use resampling methods (like SMOTE or ROSE).
+
+2\. Visualize Transaction Amount by Class
+
+```{r}
+library(scales)  # for nice axis labels
+
+ggplot(df, aes(x = Amount + 1, color = factor(Class), fill = factor(Class))) +
+  geom_density(alpha = 0.4) +
+  scale_x_log10(labels = comma) +
+  scale_fill_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  scale_color_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  labs(
+    title = "Density of Transaction Amount by Class",
+    x = "Transaction Amount (Log Scale)",
+    y = "Density",
+    fill = "Transaction Type",
+    color = "Transaction Type"
+  ) +
+  theme_minimal()
+```
+
+This plot reveals that fraudulent transactions tend to cluster around lower amounts, while non-fraudulent transactions are spread across a broader range. Fraud shows higher density below 100 units, hinting at a preference for small-value fraudulent actions.
+
+```{r}
+
+ggplot(df, aes(x = Amount + 1, fill = factor(Class))) +
+  geom_histogram(bins = 100, position = "identity", alpha = 0.6) +
+  scale_x_log10(labels = comma) +
+  scale_fill_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  labs(
+    title = "Transaction Amount by Class",
+    x = "Transaction Amount (Log Scale)",
+    y = "Count",
+    fill = "Transaction Type"
+  ) +
+  theme_minimal()
+```
+
+3\. Transaction Time by Class
+
+```{r}
+df$Hour <- (df$Time %% (60*60*24)) / 3600  # convert to hour in day
+
+ggplot(df, aes(x = Hour, fill = factor(Class), color = factor(Class))) +
+  geom_density(alpha = 0.4, adjust = 1.2) +
+  scale_fill_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  scale_color_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  labs(
+    title = "Density of Transactions by Hour of Day",
+    x = "Hour of Day",
+    y = "Density",
+    fill = "Class",
+    color = "Class"
+  ) +
+  theme_minimal()
+```
+
+This plot shows when during the day fraudulent vs. non-fraudulent transactions are most likely to occur. Although the dataset spans two days, we compress both days into a 24-hour cycle to capture daily patterns.
+
+Non-fraudulent transactions are fairly evenly distributed throughout the day, with a peak during business hours.
+
+Fraudulent transactions, however, appear slightly more concentrated in the early morning (around 1–6 AM), when regular activity is lower.
+
+This could suggest that fraud attempts are more likely to occur when users or bank systems are less active, possibly to avoid detection.
+
+## Resampling
+
+```{r}
+# Check class imbalance
+table(df$Class)
+prop.table(table(df$Class))  # Percent fraud vs. normal
+```
+
+We’ll keep all the fraud cases (Class = 1), generate synthetic ones, and reduce the number of non-fraud cases (Class = 0) to create a balanced training set.
+
+```{r}
+
+# install.packages("remotes")
+# remotes::install_github("cran/DMwR")
+
+# Load DMwR and convert target to factor
+library(DMwR)
+df$Class <- as.factor(df$Class)
+
+```
+
+```{r}
+# Apply SMOTE with Undersampling
+set.seed(1)
+
+df_smote_under <- SMOTE(Class ~ ., data = df, perc.over = 600, perc.under = 100)
+
+table(df_smote_under$Class)
+```
+
+perc.over = 600 → SMOTE created 6 synthetic cases per real fraud → 492 × 6 = 2952 synthetic frauds
+
+Total frauds after SMOTE = 492 original + 2952 synthetic = 3444
+
+perc.under = 100 → You keep 1 non-fraud for each fraud → So, 2952 non-frauds were selected from the original 284,315
+
+```{r}
+ggplot(df_smote_under, aes(x = Class)) +
+  geom_bar(fill = c("steelblue", "firebrick")) +
+  labs(title = "Class Distribution After SMOTE + Undersampling", x = "Class", y = "Count") +
+  theme_minimal()
+```
+
+After applying SMOTE with 600% oversampling and 1:1 undersampling, we generated 3444 fraud cases (492 real + 2952 synthetic) and kept 2952 non-fraud cases. This gives us a nearly balanced dataset (54% fraud vs. 46% non-fraud) suitable for training without being overwhelmed by majority class bias.
