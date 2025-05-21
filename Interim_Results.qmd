@@ -1,0 +1,348 @@
+---
+title: "Interim Results"
+author: "Lu"
+format: html
+editor: visual
+---
+
+## Load the Dataset
+
+```{r}
+# Load packages
+suppressPackageStartupMessages({
+library(tidyverse)
+library(skimr)
+library(reshape2)
+library(corrplot)
+library(scales)  # for nice axis labels
+library(caret)
+library(MASS)
+library(car)
+library(h2o)
+
+  
+# install.packages("remotes")
+# remotes::install_github("cran/DMwR")
+
+# Load DMwR and convert target to factor
+library(DMwR)
+})
+
+# Read the dataset
+df <- read.csv("creditcard.csv")
+
+summary(df)
+df$Hour <- (df$Time %% (60*60*24)) / 3600  # convert to hour in day
+
+```
+
+```{r}
+skim(df)
+```
+
+All predictors are numeric.
+
+Class is extremely imbalanced, so we must handle this before modeling.
+
+Many PCA variables have non-normal, high-variance distributions → visual EDA (boxplots, density plots) will help us decide if some features are especially important.
+
+Amount and Time are not standardized — these need scaling or transformation.
+
+## EDA
+
+1\. Visualize Class Imbalance
+
+```{r}
+ggplot(df, aes(x = factor(Class))) +
+  geom_bar(aes(fill = factor(Class))) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.2) +
+  scale_fill_manual(values = c("steelblue", "firebrick")) +
+  labs(title = "Class Distribution", x = "Class (0 = Non-Fraud, 1 = Fraud)", y = "Count") +
+  theme_minimal()
+```
+
+This bar chart shows the number of transactions for each class in our dataset. We clearly see a massive imbalance:
+
+There are 284,315 non-fraudulent transactions (class 0), making up nearly 99.83% of the data.
+
+In contrast, there are only 492 fraudulent transactions (class 1), which is about 0.17% of the total.
+
+If we trained a model without addressing this imbalance, it might just predict "non-fraud" for everything and still appear 99.8% "accurate" — but it would fail to catch real fraud. This makes it essential to use resampling methods (like SMOTE or ROSE).
+
+2\. Visualize Transaction Amount by Class
+
+```{r}
+
+
+ggplot(df, aes(x = Amount + 1, color = factor(Class), fill = factor(Class))) +
+  geom_density(alpha = 0.4) +
+  scale_x_log10(labels = comma) +
+  scale_fill_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  scale_color_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  labs(
+    title = "Density of Transaction Amount by Class",
+    x = "Transaction Amount (Log Scale)",
+    y = "Density",
+    fill = "Transaction Type",
+    color = "Transaction Type"
+  ) +
+  theme_minimal()
+```
+
+This plot reveals that fraudulent transactions tend to cluster around lower amounts, while non-fraudulent transactions are spread across a broader range. Fraud shows higher density below 100 units, hinting at a preference for small-value fraudulent actions.
+
+```{r}
+
+ggplot(df, aes(x = Amount + 1, fill = factor(Class))) +
+  geom_histogram(bins = 100, position = "identity", alpha = 0.6) +
+  scale_x_log10(labels = comma) +
+  scale_fill_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  labs(
+    title = "Transaction Amount by Class",
+    x = "Transaction Amount (Log Scale)",
+    y = "Count",
+    fill = "Transaction Type"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(df, aes(x = factor(Class), y = Amount)) +
+  geom_boxplot() +
+  labs(title = "Boxplots of Amount by Class",
+       x = "Class",
+       y = "Amount") +
+  theme_minimal()
+```
+
+3\. Transaction Time by Class
+
+```{r}
+df$Hour <- (df$Time %% (60*60*24)) / 3600  # convert to hour in day
+
+ggplot(df, aes(x = Hour, fill = factor(Class), color = factor(Class))) +
+  geom_density(alpha = 0.4, adjust = 1.2, bw = 0.1) +
+  scale_fill_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  scale_color_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  labs(
+    title = "Density of Transactions by Hour of Day",
+    x = "Hour of Day",
+    y = "Density",
+    fill = "Class",
+    color = "Class"
+  ) +
+  theme_minimal()
+```
+
+This plot shows when during the day fraudulent vs. non-fraudulent transactions are most likely to occur. Although the dataset spans two days, we compress both days into a 24-hour cycle to capture daily patterns.
+
+Non-fraudulent transactions are fairly evenly distributed throughout the day, with a peak during business hours.
+
+Fraudulent transactions, however, appear slightly more concentrated in the early morning (around 1–6 AM), when regular activity is lower.
+
+This could suggest that fraud attempts are more likely to occur when users or bank systems are less active, possibly to avoid detection.
+
+4.  Correlation Matrix of Features
+
+```{r}
+
+# Compute correlation matrix
+cor_matrix <- cor(df[, -which(names(df) == "Class")])  # Exclude 'Class'
+
+# Base R heatmap using corrplot
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.cex = 0.7, tl.col = "black", title = "Correlation Heatmap", mar = c(0,0,1,0))
+
+```
+
+5.  T-test on Amount for Fraud vs. Non-Fraud
+
+    ```{r}
+    t_test_result <- t.test(Amount ~ Class, data = df)
+    print(t_test_result)
+    ```
+
+## Resampling
+
+```{r}
+# Check class imbalance
+table(df$Class)
+prop.table(table(df$Class))  # Percent fraud vs. normal
+```
+
+We’ll keep all the fraud cases (Class = 1), generate synthetic ones, and reduce the number of non-fraud cases (Class = 0) to create a balanced training set.
+
+```{r}
+
+df$Class <- as.factor(df$Class)
+
+```
+
+```{r}
+# Apply SMOTE with Undersampling
+set.seed(1)
+
+df_smote_under <- SMOTE(Class ~ ., data = df, perc.over = 600, perc.under = 100)
+
+table(df_smote_under$Class)
+```
+
+perc.over = 600 → SMOTE created 6 synthetic cases per real fraud → 492 × 6 = 2952 synthetic frauds
+
+Total frauds after SMOTE = 492 original + 2952 synthetic = 3444
+
+perc.under = 100 → You keep 1 non-fraud for each fraud → So, 2952 non-frauds were selected from the original 284,315
+
+```{r}
+ggplot(df_smote_under, aes(x = Class)) +
+  geom_bar(fill = c("steelblue", "firebrick")) +
+  labs(title = "Class Distribution After SMOTE + Undersampling", x = "Class", y = "Count") +
+  theme_minimal()
+```
+
+After applying SMOTE with 600% oversampling and 1:1 undersampling, we generated 3444 fraud cases (492 real + 2952 synthetic) and kept 2952 non-fraud cases. This gives us a nearly balanced dataset (54% fraud vs. 46% non-fraud) suitable for training without being overwhelmed by majority class bias.
+
+## Basic Model Fitting with Original Data Set
+
+1.  Scale the Features
+
+    ```{r}
+    features <- df[, setdiff(names(df), "Class")]
+
+    # Scale features
+    scaled_features <- as.data.frame(scale(features))
+
+    # Combine with target column
+    df_scaled <- cbind(scaled_features, Class = df$Class)
+    ```
+
+2.  Create Train/Test Split
+
+    ```{r}
+
+    set.seed(123)
+    df_scaled$Class <- as.factor(df_scaled$Class)
+    train_index <- createDataPartition(df_scaled$Class, p = 0.7, list = FALSE)
+
+    train_data <- df_scaled[train_index, ]
+    test_data  <- df_scaled[-train_index, ]
+    ```
+
+3.  Fit a Logistic Regression Model using whole data
+
+    ```{r}
+
+    # Fit initial logistic model on all predictors
+    initial_model <- glm(Class ~ ., data = train_data, family = binomial)
+
+    summary(initial_model)
+
+    ```
+
+4.  Check Variance Inflation Factor for Multicollinearity
+
+    ```{r}
+    vif(initial_model)
+    ```
+
+Rule of thumb –\> Vif \>10 is a sign of multicollinearity –\> we have many values \>10
+
+## Model with Regularization (LASSO)
+
+```{r}
+h2o.init(nthreads = -1)
+
+# Convert to H2O frame
+train_h2o <- as.h2o(train_data)
+test_h2o <- as.h2o(test_data)
+
+# Train lasso (lambda search enabled)
+model <- h2o.glm(x = setdiff(names(train_data), "Class"),
+                 y = "Class",
+                 training_frame = train_h2o,
+                 family = "binomial",
+                 alpha = 1,
+                 lambda_search = TRUE)
+
+# Predict
+pred <- h2o.predict(model, test_h2o)
+```
+
+```{r}
+perf <- h2o.performance(model, newdata = test_h2o)
+
+# Plot ROC curve
+plot(perf, type = "roc")
+```
+
+```{r}
+h2o.auc(perf)          # Print AUC value
+best_thresh <- h2o.find_threshold_by_max_metric(perf, "f1")
+
+print(best_thresh)
+```
+
+```{r}
+h2o.confusionMatrix(perf, metrics = "f1", thresholds = best_thresh)
+
+```
+
+## Autoencoders for Anomaly Detection
+
+1.  Convert scaled features to h2o dataframe
+
+```{r}
+# Convert whole data to H2O frame (except labels)
+data_h2o <- as.h2o(scaled_features)
+```
+
+2.  Apply autoencoder model
+
+```{r}
+autoencoder <- h2o.deeplearning(
+  x = names(scaled_features),
+  training_frame = data_h2o,
+  autoencoder = TRUE,
+  hidden = c(10, 2, 10),  # symmetrical bottleneck
+  epochs = 50,
+  activation = "Tanh",
+  seed = 123
+)
+```
+
+The small hidden layer (2 in the center) forces the model to compress information — anomalies will reconstruct poorly.
+
+3.  Get Reconstruction Error (Anomaly Score)
+
+```{r}
+recon_error <- h2o.anomaly(autoencoder, data_h2o, per_feature = FALSE)
+recon_error_df <- as.data.frame(recon_error)
+colnames(recon_error_df) <- "MSE"
+```
+
+4.  Add Class Labels Back for Evaluation
+
+    ```{r}
+    recon_error_df$Class <- df_scaled$Class
+
+    ```
+
+5.  Confusion Matrix
+
+    ```{r}
+    threshold <- quantile(recon_error_df$MSE, 0.95)
+
+    # Predict anomalies
+    recon_error_df$pred <- ifelse(recon_error_df$MSE > threshold, 1, 0)
+
+    confusionMatrix(factor(recon_error_df$pred), factor(recon_error_df$Class), positive = "1")
+    ```
+
+6.  Plot the reconstruction error
+
+    ```{r}
+    ggplot(recon_error_df, aes(x = MSE, fill = factor(Class))) +
+      geom_density(alpha = 0.5) +
+      labs(title = "Reconstruction Error by Class", x = "Reconstruction MSE", fill = "Class") +
+      theme_minimal()
+    ```
