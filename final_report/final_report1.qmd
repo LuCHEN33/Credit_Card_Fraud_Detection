@@ -1,0 +1,718 @@
+---
+title: "Credit Card Fraud Detection"
+author:
+  - name: Group_A4
+    affiliations:
+      - Chen Lu
+      - Doder Benjamin
+      - Koblmiller Julia Elisabeth
+      - Olcay Fuat Sarp
+      - Yin Haichuan
+subtitle: "A4 Project Report"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+self-contained: true
+code-link: true
+code-tools: true
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    document-class: article
+    fontsize: 11pt
+    geometry: margin=1in
+    highlight-style: github
+    keep-tex: true
+    # if you want smaller code font:
+    # listings:
+    #   basicstyle: "\small\ttfamily"
+---
+
+## Load the Dataset
+
+```{r}
+# Load packages
+suppressPackageStartupMessages({
+library(tidyverse)
+library(skimr)
+library(reshape2)
+library(corrplot)
+library(scales)  # for nice axis labels
+library(caret)
+library(MASS)
+library(car)
+library(h2o)
+library(xgboost)
+library(pROC)
+library(e1071)
+library(randomForest)
+library(ROSE)
+library(DMwR)
+  
+# install.packages("remotes")
+# remotes::install_github("cran/DMwR")
+
+# Load DMwR and convert target to factor
+
+})
+
+# Read the dataset
+df <- read.csv("creditcard.csv")
+
+summary(df)
+df$Hour <- (df$Time %% (60*60*24)) / 3600  # convert to hour in day
+dplyr::select(df, !"Time") -> df
+```
+
+```{r}
+skim(df)
+```
+
+All predictors are numeric.
+
+Class is extremely imbalanced, so we must handle this before modeling.
+
+Many PCA variables have non-normal, high-variance distributions → visual EDA (boxplots, density plots) will help us decide if some features are especially important.
+
+Amount and Time are not standardized — these need scaling or transformation.
+
+## EDA
+
+1\. Visualize Class Imbalance
+
+```{r}
+ggplot(df, aes(x = factor(Class))) +
+  geom_bar(aes(fill = factor(Class))) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.2) +
+  scale_fill_manual(values = c("steelblue", "firebrick")) +
+  labs(title = "Class Distribution", x = "Class (0 = Non-Fraud, 1 = Fraud)", y = "Count") +
+  theme_minimal()
+```
+
+This bar chart shows the number of transactions for each class in our dataset. We clearly see a massive imbalance:
+
+There are 284,315 non-fraudulent transactions (class 0), making up nearly 99.83% of the data.
+
+In contrast, there are only 492 fraudulent transactions (class 1), which is about 0.17% of the total.
+
+If we trained a model without addressing this imbalance, it might just predict "non-fraud" for everything and still appear 99.8% "accurate" — but it would fail to catch real fraud. This makes it essential to use resampling methods (like SMOTE or ROSE).
+
+2\. Visualize Transaction Amount by Class
+
+```{r}
+
+
+ggplot(df, aes(x = Amount + 1, color = factor(Class), fill = factor(Class))) +
+  geom_density(alpha = 0.4) +
+  scale_x_log10(labels = comma) +
+  scale_fill_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  scale_color_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  labs(
+    title = "Density of Transaction Amount by Class",
+    x = "Transaction Amount (Log Scale)",
+    y = "Density",
+    fill = "Transaction Type",
+    color = "Transaction Type"
+  ) +
+  theme_minimal()
+```
+
+This plot reveals that fraudulent transactions tend to cluster around lower amounts, while non-fraudulent transactions are spread across a broader range. Fraud shows higher density below 100 units, hinting at a preference for small-value fraudulent actions.
+
+```{r}
+
+ggplot(df, aes(x = Amount + 1, fill = factor(Class))) +
+  geom_histogram(bins = 100, position = "identity", alpha = 0.6) +
+  scale_x_log10(labels = comma) +
+  scale_fill_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  labs(
+    title = "Transaction Amount by Class",
+    x = "Transaction Amount (Log Scale)",
+    y = "Count",
+    fill = "Transaction Type"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(df, aes(x = factor(Class), y = Amount)) +
+  geom_boxplot() +
+  labs(title = "Boxplots of Amount by Class",
+       x = "Class",
+       y = "Amount") +
+  theme_minimal()
+```
+
+3\. Transaction Time by Class
+
+```{r}
+
+ggplot(df, aes(x = Hour, fill = factor(Class), color = factor(Class))) +
+  geom_density(alpha = 0.4, adjust = 1.2, bw = 0.1) +
+  scale_fill_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  scale_color_manual(values = c("steelblue", "firebrick"), labels = c("Non-Fraud", "Fraud")) +
+  labs(
+    title = "Density of Transactions by Hour of Day",
+    x = "Hour of Day",
+    y = "Density",
+    fill = "Class",
+    color = "Class"
+  ) +
+  theme_minimal()
+```
+
+This plot shows when during the day fraudulent vs. non-fraudulent transactions are most likely to occur. Although the dataset spans two days, we compress both days into a 24-hour cycle to capture daily patterns.
+
+Non-fraudulent transactions are fairly evenly distributed throughout the day, with a peak during business hours.
+
+Fraudulent transactions, however, appear slightly more concentrated in the early morning (around 1–6 AM), when regular activity is lower.
+
+This could suggest that fraud attempts are more likely to occur when users or bank systems are less active, possibly to avoid detection.
+
+4.  Correlation Matrix of Features
+
+```{r}
+
+# Compute correlation matrix
+cor_matrix <- cor(df[, -which(names(df) == "Class")])  # Exclude 'Class'
+
+# Base R heatmap using corrplot
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.cex = 0.7, tl.col = "black", title = "Correlation Heatmap", mar = c(0,0,1,0))
+
+```
+
+5.  T-test on Amount for Fraud vs. Non-Fraud
+
+    ```{r}
+    t_test_result <- t.test(Amount ~ Class, data = df)
+    print(t_test_result)
+    ```
+
+## Resampling
+
+```{r}
+# Check class imbalance
+table(df$Class)
+prop.table(table(df$Class))  # Percent fraud vs. normal
+```
+
+We’ll keep all the fraud cases (Class = 1), generate synthetic ones, and reduce the number of non-fraud cases (Class = 0) to create a balanced training set.
+
+```{r}
+
+df$Class <- as.factor(df$Class)
+
+```
+
+```{r}
+# Apply SMOTE with Undersampling
+set.seed(1)
+
+df_smote_under <- SMOTE(Class ~ ., data = df, perc.over = 600, perc.under = 100)
+
+table(df_smote_under$Class)
+```
+
+perc.over = 600 → SMOTE created 6 synthetic cases per real fraud → 492 × 6 = 2952 synthetic frauds
+
+Total frauds after SMOTE = 492 original + 2952 synthetic = 3444
+
+perc.under = 100 → You keep 1 non-fraud for each fraud → So, 2952 non-frauds were selected from the original 284,315
+
+```{r}
+ggplot(df_smote_under, aes(x = Class)) +
+  geom_bar(fill = c("steelblue", "firebrick")) +
+  labs(title = "Class Distribution After SMOTE + Undersampling", x = "Class", y = "Count") +
+  theme_minimal()
+```
+
+After applying SMOTE with 600% oversampling and 1:1 undersampling, we generated 3444 fraud cases (492 real + 2952 synthetic) and kept 2952 non-fraud cases. This gives us a nearly balanced dataset (54% fraud vs. 46% non-fraud) suitable for training without being overwhelmed by majority class bias.
+
+## Basic Model Fitting with Original Data Set
+
+1.  Scale the Features
+
+    ```{r}
+    features <- df[, setdiff(names(df), "Class")]
+
+    # Scale features
+    scaled_features <- as.data.frame(scale(features))
+
+    # Combine with target column
+    df_scaled <- cbind(scaled_features, Class = df$Class)
+    ```
+
+2.  Create Train/Test Split
+
+    ```{r}
+
+    set.seed(123)
+    df_scaled$Class <- as.factor(df_scaled$Class)
+    train_index <- createDataPartition(df_scaled$Class, p = 0.7, list = FALSE)
+
+    train_data <- df_scaled[train_index, ]
+    test_data  <- df_scaled[-train_index, ]
+    ```
+
+3.  Fit a Logistic Regression Model using whole data
+
+    ```{r}
+
+    # Fit initial logistic model on all predictors
+    initial_model <- glm(Class ~ ., data = train_data, family = binomial)
+
+    summary(initial_model)
+
+    ```
+
+4.  Check Variance Inflation Factor for Multicollinearity
+
+    ```{r}
+    vif(initial_model)
+    ```
+
+Rule of thumb –\> Vif \>10 is a sign of multicollinearity –\> we have many values \>10
+
+```{r}
+log_prob <- predict(initial_model, newdata = test_data, type = "response")
+```
+
+
+## Model with Regularization (LASSO)
+
+```{r, message=FALSE}
+h2o.init(nthreads = -1)
+
+# Convert to H2O frame
+train_h2o <- as.h2o(train_data)
+test_h2o <- as.h2o(test_data)
+
+# Train lasso (lambda search enabled)
+model <- h2o.glm(x = setdiff(names(train_data), "Class"),
+                 y = "Class",
+                 training_frame = train_h2o,
+                 family = "binomial",
+                 alpha = 1,
+                 lambda_search = TRUE)
+
+# Predict
+lasso_pred <- h2o.predict(model, test_h2o)
+```
+
+```{r}
+lasso_perf <- h2o.performance(model, newdata = test_h2o)
+
+# Plot ROC curve
+plot(lasso_perf, type = "roc")
+```
+
+
+
+## Autoencoders for Anomaly Detection
+
+
+1.  Apply autoencoder model
+
+```{r, message=FALSE}
+autoencoder <- h2o.deeplearning(
+  x = names(scaled_features),
+  training_frame = train_h2o,
+  autoencoder = TRUE,
+  hidden = c(10, 2, 10),  # symmetrical bottleneck
+  epochs = 50,
+  activation = "Tanh",
+  seed = 123
+)
+```
+
+The small hidden layer (2 in the center) forces the model to compress information — anomalies will reconstruct poorly.
+
+3.  Get Reconstruction Error (Anomaly Score)
+
+```{r}
+recon_error <- h2o.anomaly(autoencoder, train_h2o, per_feature = FALSE)
+recon_error_df <- as.data.frame(recon_error)
+colnames(recon_error_df) <- "MSE"
+```
+
+4.  Add Class Labels Back for Evaluation
+
+    ```{r}
+    recon_error_df$Class <- train_data$Class
+
+    ```
+
+5.  Confusion Matrix
+
+    ```{r}
+    threshold <- quantile(recon_error_df$MSE, 0.98)
+
+    # Predict anomalies
+    recon_error_df$pred <- ifelse(recon_error_df$MSE > threshold, 1, 0)
+
+    confusionMatrix(factor(recon_error_df$pred), factor(recon_error_df$Class), positive = "1")
+    ```
+
+6.  Plot the reconstruction error
+
+    ```{r}
+    ggplot(recon_error_df, aes(x = MSE, fill = factor(Class))) +
+      geom_density(alpha = 0.5) +
+      labs(title = "Reconstruction Error by Class", x = "Reconstruction MSE", fill = "Class") +
+      theme_minimal()
+    ```
+
+## XGBoost Model Original Data
+
+We proceeded with applying the XGBoost- Extreme Gradient Boosting algorithm to the data. Given the highly imbalanced credit card fraud dataset, we aim to inspect the algorithms ability to capture complex interactions and decision boundaries.
+
+1.  Convert data to DMatrix
+
+```{r}
+y_train_bin <- as.numeric(train_data$Class) - 1  # 1 for "pos", 0 for "neg"
+y_test_bin  <- as.numeric(test_data$Class) - 1
+
+dtrain <- xgb.DMatrix(
+  data  = as.matrix(train_data[ , setdiff(names(train_data), "Class")]),
+  label = y_train_bin
+)
+dtest <- xgb.DMatrix(
+  data  = as.matrix(test_data[  , setdiff(names(test_data),  "Class")]),
+  label = y_test_bin
+)
+
+```
+
+Both test and training data was converted into a special format xgb.DMatrix. Reasoning:
+
+-   optimized for speed and memory efficiency
+
+-   supports the weighting of individual rows, which can be used to manage class imbalance
+
+2.  Define Hyperparamters
+
+```{r}
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6
+)
+```
+
+The baseline hyperparameters of the XGBoost model are the following
+
+-   learning rate of 0.1
+
+-   max tree depth of 6 - moderate depth, enough to detect important interactions without overly complexity
+
+-   early stopping rounds of 10 - stop training if performance on the validation set doesn't improve
+
+-   auc evaluation metric - wellsuited for imbalanced classification problems
+
+3.  Train the Model using df_scaled training data
+
+```{r}
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+# Predict probabilities and labels
+xgb_pred_prob <- predict(xgb_model, dtest)
+xgb_pred_label <- ifelse(xgb_pred_prob > 0.5, 1, 0)
+```
+
+The trained XGBoost model generates probabilites on the test set. Hard class labels are applied to the predicated probability. Within the thresholds:
+
+-   \> .50 it is labeled as fraud (1)
+
+-   \<= .50 it is labeled as non-fraud (0)
+
+4.  Inspect Prediction Probability Distribution
+
+```{r}
+summary(xgb_pred_prob)
+hist(xgb_pred_prob, breaks = 50, main = "Histogram of Predicted Probabilities", xlab = "Probability")
+
+```
+
+5.  Confusion Matrix & AUC Curve
+
+```{r}
+conf_matrix <- confusionMatrix(
+  factor(xgb_pred_label),
+  factor(getinfo(dtest, "label")),
+  positive = "1"
+)
+print(conf_matrix)
+
+# ROC and AUC
+roc_obj <- roc(getinfo(dtest, "label"), xgb_pred_prob)
+plot(roc_obj, main = "XGBoost ROC Curve")
+cat("AUC:", auc(roc_obj), "\n")
+```
+
+When using the original imbalanced dataset, the ROC curve shows a less steep shape, and the model is less confident in distinguishing fraud due to the extreme class imbalance. This limits sensitivity and causes the ROC curve to underperform. We try to address this with a Resampling method ROSE.
+
+## XGBoost with Resampling
+
+Resample the Dataset by oversampling the minority
+
+
+2.  Apply ROSE to the scaled data to balance it
+
+```{r}
+set.seed(123)
+train_index <- createDataPartition(df_scaled$Class, p = 0.7, list = FALSE)
+train_raw <- df_scaled[train_index, ]
+test_data_xg <- df_scaled[-train_index, ]
+
+# Now apply ROSE only to the training set
+
+train_data_xg <- ROSE(Class ~ ., data = train_raw, seed = 1, N = nrow(train_raw), p = 0.2)$data
+```
+
+4.  Convert to DMatrix
+
+```{r}
+dtrain_xg <- xgb.DMatrix(
+  data = as.matrix(train_data_xg[, -ncol(train_data_xg)]), 
+  label = as.numeric(as.character(train_data_xg$Class))
+)
+
+dtest_xg <- xgb.DMatrix(
+  data = as.matrix(test_data_xg[, -ncol(test_data_xg)]), 
+  label = as.numeric(as.character(test_data_xg$Class))
+)
+```
+
+5.  Define Hyperparameters & create model
+
+```{r}
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6
+)
+
+xgb_model_rose <- xgb.train(
+  params = params,
+  data = dtrain_xg,
+  nrounds = 100,
+  watchlist = list(train = dtrain_xg, test = dtest_xg),
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+```
+
+6.  Predict Probabilities & Define Threshold
+
+```{r}
+xgb_rose_pred_prob <- predict(xgb_model, dtest_xg)
+xgb_rose_pred_label <- ifelse(xgb_rose_pred_prob > 0.8, 1, 0)
+```
+
+7.  Confusion Matrix
+
+```{r}
+conf_matrix <- confusionMatrix(
+  factor(xgb_rose_pred_label),
+  factor(getinfo(dtest_xg, "label")),
+  positive = "1"
+)
+print(conf_matrix)
+```
+
+8.  AUC, ROC Curve
+
+    ```{r}
+# ROC and AUC
+roc_obj <- roc(getinfo(dtest_xg, "label"), xgb_rose_pred_label)
+plot(roc_obj, main = "XGBoost ROC Curve")
+cat("AUC:", auc(roc_obj), "\n")
+    ```
+
+After applying ROSE resampling with a 20% fraud rate (`p = 0.2`), the ROC curve becomes significantly sharper and more optimistic. This happens because:
+
+-   The model now sees more fraud cases during training
+
+-   It learns a clearer decision boundary between classes
+
+-   However, this also introduces some synthetic data artifacts, and the results can overestimate real-world performance
+
+
+## Support Vector Machines
+
+```{r, eval=FALSE}
+#––– Caret trainControl –––
+ctrl <- trainControl(
+  method           = "cv",
+  number           = 5,
+  summaryFunction  = twoClassSummary,
+  classProbs       = TRUE,
+  verboseIter      = TRUE
+)
+
+# rename levels for twoClassSummary (“pos” must be the second level)
+levels(train_data$Class) <- c("neg","pos")
+levels(test_data$Class)  <- c("neg","pos")
+
+# SVM Grid Search
+svm_grid <- expand.grid(
+  sigma = c(0.001, 0.01),
+  C     = c(0.1, 1, 10)
+)
+
+set.seed(123)
+svm_tuned <- train(
+  Class ~ .,
+  data     = train_data,
+  method   = "svmRadial",
+  metric   = "ROC",
+  trControl= ctrl,
+  tuneGrid = svm_grid
+)
+
+saveRDS(rf_tuned, "rf_tuned.RDS")
+
+```
+
+
+
+
+```{r}
+svm_tuned = readRDS("svm_tuned.RDS")
+
+
+print(svm_tuned)
+# best parameters:
+svm_tuned$bestTune
+```
+
+
+
+
+## Random Forest
+
+```{r, eval=FALSE}
+#Random Forest Grid Search
+rf_grid <- expand.grid(
+  mtry = c(2, 4, 6, 8)
+)
+
+set.seed(123)
+rf_tuned <- train(
+  Class ~ .,
+  data      = train_data,
+  method    = "rf",
+  metric    = "ROC",
+  trControl = ctrl,
+  tuneGrid  = rf_grid,
+  ntree     = 100
+)
+
+saveRDS(rf_tuned, "rf_tuned.RDS")
+```
+
+```{r}
+rf_tuned = readRDS("rf_tuned.RDS")
+
+print(rf_tuned)
+rf_tuned$bestTune
+```
+
+
+## Evaluating all models on Confusion Matrix
+```{r, message=FALSE}
+
+
+# find threshold maximizing F1
+find_best_thr <- function(probs, truth, pos_label="pos") {
+  # truth: factor with levels c("neg","pos")
+  thresholds <- seq(0, 1, by = 0.01)
+  f1_scores  <- sapply(thresholds, function(th) {
+    preds <- factor(ifelse(probs > th, pos_label, 
+                           setdiff(levels(truth), pos_label)),
+                    levels = levels(truth))
+    cm    <- confusionMatrix(preds, truth, positive = pos_label)
+    as.numeric(cm$byClass["F1"])
+  })
+  best_idx <- which.max(f1_scores)
+  list(threshold = thresholds[best_idx], f1 = f1_scores[best_idx])
+}
+
+#Re‐define eval to take an arbitrary threshold
+evaluate_at_thr <- function(probs, truth, thr, model_name) {
+  preds <- factor(ifelse(probs > thr, "pos", "neg"), levels = c("neg","pos"))
+  cm    <- confusionMatrix(preds, truth, positive = "pos")
+  auc   <- roc(response = as.numeric(truth=="pos"), predictor = probs)$auc
+  cat("\n=== ", model_name, " (thr=", round(thr,2), ") ===\n", sep = "")
+  print(cm)
+  cat("AUC:", round(auc,4), "\n",
+      "F1:", round(cm$byClass["F1"], 4), "\n")
+}
+
+
+
+# 3) Apply to each model
+
+## (a) Logistic regression
+log_prob <- predict(initial_model, newdata = test_data, type = "response")
+# truth factor
+truth <- factor(ifelse(test_data$Class == 1, "pos", "neg"))
+best <- find_best_thr(log_prob, truth)
+evaluate_at_thr(log_prob, truth, best$threshold, "Logistic Regression")
+
+## (b) LASSO (H2O)
+lasso_h2o  <- h2o.predict(model, test_h2o)
+lasso_prob <- as.vector(lasso_h2o$p1)
+best <- find_best_thr(lasso_prob, truth)
+evaluate_at_thr(lasso_prob, truth, best$threshold, "LASSO (H2O)")
+
+## (c) Autoencoder anomaly (use MSE as “prob”)
+
+recon_error <- h2o.anomaly(autoencoder, test_h2o, per_feature = FALSE)
+recon_error_df <- as.data.frame(recon_error)
+colnames(recon_error_df) <- "MSE"
+
+
+ae_prob <- recon_error_df$MSE
+
+# map levels to neg/pos
+best <- find_best_thr(ae_prob, truth)
+evaluate_at_thr(ae_prob, truth, best$threshold, "Autoencoder")
+
+## (d) XGBoost final
+xgb_prob <- predict(xgb_model, dtest)
+best     <- find_best_thr(xgb_prob, truth)
+evaluate_at_thr(xgb_prob, truth, best$threshold, "XGBoost")
+
+## (e) XGBoost + ROSE (if available)
+
+xgbr_prob <- predict(xgb_model_rose, dtest_xg)
+truth_rose <- factor(test_data_xg$Class, levels=c("0","1"))
+truth_rose <- factor(ifelse(truth_rose=="1","pos","neg"), levels=c("neg","pos"))
+best <- find_best_thr(xgbr_prob, truth_rose)
+evaluate_at_thr(xgbr_prob, truth_rose, best$threshold, "XGBoost (ROSE)")
+
+
+## (f) SVM (caret)
+svm_prob <- predict(svm_tuned, test_data, type = "prob")[, "pos"]
+best     <- find_best_thr(svm_prob, truth)
+evaluate_at_thr(svm_prob, truth, best$threshold, "SVM")
+
+## (g) Random Forest (caret)
+rf_prob <- predict(rf_tuned, test_data, type = "prob")[, "pos"]
+best    <- find_best_thr(rf_prob, truth)
+evaluate_at_thr(rf_prob, truth, best$threshold, "Random Forest")
+
+```
+
+
+
