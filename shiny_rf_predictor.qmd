@@ -1,0 +1,128 @@
+---
+title: "Fraud Detection Shiny App"
+format: html
+editor: visual
+runtime: shiny
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+::: callout-note
+Use sliders for V1–V19 and Hour of Day to predict fraud probability using the trained Random Forest model.
+:::
+
+
+
+```{r setup, include=FALSE}
+# Load required libraries
+library(shiny)
+library(randomForest)
+
+# Load pre-trained Random Forest model
+rf_model <- readRDS("rf_tuned.RDS")
+
+# Define slider ranges for V1–V19 (min, max)
+v_ranges <- list(
+  c(-56, 48),  c(-72, 23),  c(-48, 27),  c(-5, 6),    c(-113, 34),
+  c(-26, 73),  c(-43,120),  c(-74, 20),  c(-13, 16),  c(-24, 28),
+  c(-4, 4),    c(-18, 7),   c(-5, 7),    c(-19, 11), c(-4, 6),
+  c(-14,15),   c(-25,10),   c(-9, 3),    c(-10,1)
+)
+
+# Define slider range for Hour (0–23)
+hour_range <- c(0, 23)
+```
+
+
+
+```{r ui, echo=FALSE}
+# UI: sliders for V1–V19 and Hour, button, and output
+fluidPage(
+  tags$head(
+    tags$style(HTML(
+ ".jumbotron { background-color: #007bff; color: #fff; padding: 2rem; border-radius: .5rem; }
+       .panel-custom { background: #fff; box-shadow: 0 0 10px rgba(0,0,0,0.1); border-radius: .5rem; padding: 1rem; margin-bottom: 1rem; }
+       .btn-success { background-color: #28a745; border-color: #28a745; }
+       #prediction { margin-top: 20px; font-size: 1.3em; color: #007bff; font-weight: bold; }"
+    ))
+  ),
+
+  # titlePanel(div(class="jumbotron", "Fraud Detection with RF Model")),
+  
+  fluidRow(
+    # Left column: V1–V10
+    column(6,
+      div(class="panel-custom",
+        h4("Features V1–V10"),
+        lapply(1:10, function(i) {
+          sliderInput(paste0("V", i), paste("V", i),
+                      min = v_ranges[[i]][1], max = v_ranges[[i]][2],
+                      value = mean(v_ranges[[i]]), step = 0.1, ticks = FALSE)
+        })
+      )
+    ),
+    # Right column: V11–V19 + Hour
+    column(6,
+      div(class="panel-custom",
+        h4("Features V11–V19"),
+        lapply(11:19, function(i) {
+          sliderInput(paste0("V", i), paste("V", i),
+                      min = v_ranges[[i]][1], max = v_ranges[[i]][2],
+                      value = mean(v_ranges[[i]]), step = 0.1, ticks = FALSE)
+        }),
+        hr(),
+        h4("Hour of Day"),
+        sliderInput("Hour", NULL,
+                    min = hour_range[1], max = hour_range[2],
+                    value = median(hour_range), step = 1, ticks = TRUE)
+      )
+    )
+  ),
+  
+ # Centered Predict button with extra spacing
+  fluidRow(
+    column(12, align = "center",
+      style = "margin: 40px 0;",  # <-- added top/bottom margin here
+      actionButton("predict",
+                   label = " Predict Fraud Probability",
+                   icon = icon("search-dollar", class = "fa-lg"),
+                   class = "btn btn-success btn-lg")
+    )
+  ),
+  
+  # Prediction output
+  fluidRow(
+    column(12, align = "center",
+      verbatimTextOutput("prediction")
+    )
+  )
+)
+
+```
+
+```{r server, include=FALSE}
+# Server logic: handle prediction
+observeEvent(input$predict, {
+  # Prepare full feature vector with zeros for V1–V28, Amount, Hour
+  feature_names <- c(paste0("V", 1:28), "Amount", "Hour")
+  full_data <- as.data.frame(matrix(0, nrow = 1, ncol = length(feature_names)))
+  colnames(full_data) <- feature_names
+
+  # Fill V1–V19 from sliders
+  for (i in 1:19) {
+    full_data[[paste0("V", i)]] <- input[[paste0("V", i)]]
+  }
+  # Fill Hour
+  full_data$Hour <- input$Hour
+
+  # Predict fraud probability (class = 1)
+  prob <- predict(rf_model, full_data, type = "prob")[,2]
+
+  # Render the result
+  output$prediction <- renderText({
+    paste0("Fraud Probability: ", round(prob * 100, 2), "%")
+  })
+})
+```
